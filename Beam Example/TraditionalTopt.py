@@ -12,6 +12,9 @@ from jax_fem.utils import save_sol
 from jax_fem.generate_mesh import get_meshio_cell_type, Mesh, rectangle_mesh
 from jax_fem.mma import optimize
 
+import logging
+logging.getLogger('jax_fem').setLevel(logging.WARNING)
+
 # Do some cleaning work. Remove old solution files.
 data_path = os.path.join(os.path.dirname(__file__), 'TraditionalTopt_data')
 files = glob.glob(os.path.join(data_path, f'vtk/*'))

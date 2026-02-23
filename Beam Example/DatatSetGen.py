@@ -12,12 +12,11 @@ from jax_fem.utils import save_sol
 from jax_fem.generate_mesh import get_meshio_cell_type, Mesh, rectangle_mesh
 from jax_fem.mma import optimize
 
+import logging
+logging.getLogger('jax_fem').setLevel(logging.WARNING)
+
 # Do some cleaning work. Remove old solution files.
 data_path = os.path.join(os.path.dirname(__file__), 'DataSet_data')
-files = glob.glob(os.path.join(data_path, f'vtk/*'))
-for f in files:
-    os.remove(f)
-
 
 # Define constitutive relationship.
 # Generally, JAX-FEM solves -div.(f(u_grad,alpha_1,alpha_2,...,alpha_N)) = b.
@@ -94,89 +93,80 @@ def fixed_location(point):
 def dirichlet_val(point):
     return 0.
 
-for i, x_load in enumerate(np.arange(1, 60)):
+run_idx = 0
+
+for vf in [0.3, 0.4, 0.5, 0.6, 0.7]:
+
+    for i, x_load in enumerate(np.arange(1, 60)):
 
 
-    dirichlet_bc_info = [[fixed_location]*2, [0, 1], [dirichlet_val]*2]
-    def make_load_location(x_load):
-        def load_location(point):
-            return np.logical_and(
-                np.logical_and(point[0] >= x_load - 1.0, point[0] <= x_load + 1.0),
-                np.isclose(point[1], 0., atol=1e-5)
-            )
-        return load_location
+        dirichlet_bc_info = [[fixed_location]*2, [0, 1], [dirichlet_val]*2]
+        def make_load_location(x_load):
+            def load_location(point):
+                return np.logical_and(
+                    np.logical_and(point[0] >= x_load - 1.0, point[0] <= x_load + 1.0),
+                    np.isclose(point[1], 0., atol=1e-5)
+                )
+            return load_location
 
-    location_fns = [make_load_location(x_load)]
+        location_fns = [make_load_location(x_load)]
 
-    # Define forward problem.
-    problem = Elasticity(mesh, vec=2, dim=2, ele_type=ele_type, dirichlet_bc_info=dirichlet_bc_info, location_fns=location_fns)
+        # Define forward problem.
+        problem = Elasticity(mesh, vec=2, dim=2, ele_type=ele_type, dirichlet_bc_info=dirichlet_bc_info, location_fns=location_fns)
 
-    print(problem.boundary_inds_list)
+        # Apply the automatic differentiation wrapper.
+        # This is a critical step that makes the problem solver differentiable.
+        fwd_pred = ad_wrapper(problem, solver_options={'umfpack_solver': {}}, adjoint_solver_options={'umfpack_solver': {}})
 
-    print(problem.fes[0].face_inds)
-    print(problem.fes[0].face_inds.shape)
-
-    # Apply the automatic differentiation wrapper.
-    # This is a critical step that makes the problem solver differentiable.
-    fwd_pred = ad_wrapper(problem, solver_options={'umfpack_solver': {}}, adjoint_solver_options={'umfpack_solver': {}})
-
-    # Define the objective function 'J_total(theta)'.
-    # In the following, 'sol = fwd_pred(params)' basically says U = U(theta).
-    def J_total(params):
-        # J(u(theta), theta)
-        sol_list = fwd_pred(params)
-        compliance = problem.compute_compliance(sol_list[0])
-        return compliance
+        # Define the objective function 'J_total(theta)'.
+        # In the following, 'sol = fwd_pred(params)' basically says U = U(theta).
+        def J_total(params):
+            # J(u(theta), theta)
+            sol_list = fwd_pred(params)
+            compliance = problem.compute_compliance(sol_list[0])
+            return compliance
 
 
-    run_dir = os.path.join(data_path, f'run_{i:03d}')
-    os.makedirs(os.path.join(run_dir, 'vtk'), exist_ok=True)
+        run_dir = os.path.join(data_path, f'run_{run_idx:04d}')
+        os.makedirs(os.path.join(run_dir), exist_ok=True)
 
-    # Output solution files to local disk
-    outputs = []
-    def output_sol(params, obj_val):
-        print(f"\nOutput solution - need to solve the forward problem again...")
-        sol_list = fwd_pred(params)
-        sol = sol_list[0]
-        vtu_path = os.path.join(run_dir, f'vtk/sol_{output_sol.counter:03d}.vtu')  
-        save_sol(problem.fe, np.hstack((sol, np.zeros((len(sol), 1)))), vtu_path, cell_infos=[('theta', problem.full_params[:, 0])])
-        print(f"compliance = {obj_val}")
-        outputs.append(obj_val)
-        output_sol.counter += 1
-    output_sol.counter = 0
+        compliance_log = []
+        theta_log = []
 
-    compliance_log = []
-
-    # Prepare J_total and dJ/d(theta) that are required by the MMA optimizer.
-    def objectiveHandle(rho):
-        # MMA solver requires (J, dJ) as inputs
-        # J has shape ()
-        # dJ has shape (...) = rho.shape
-        J, dJ = jax.value_and_grad(J_total)(rho)
-        print(type(J), J)
-        compliance_log.append(float(J))
-        output_sol(rho, J)
-        return J, dJ
+        # Prepare J_total and dJ/d(theta) that are required by the MMA optimizer.
+        def objectiveHandle(rho):
+            # MMA solver requires (J, dJ) as inputs
+            # J has shape ()
+            # dJ has shape (...) = rho.shape
+            J, dJ = jax.value_and_grad(J_total)(rho)
+            compliance_log.append(float(J))
+            theta_log.append(onp.array(rho).reshape(60, 30))  # save density directly
+            return J, dJ
 
 
-    # Prepare g and dg/d(theta) that are required by the MMA optimizer.
-    def consHandle(rho, epoch):
-        # MMA solver requires (c, dc) as inputs
-        # c should have shape (numConstraints,)
-        # dc should have shape (numConstraints, ...)
-        def computeGlobalVolumeConstraint(rho):
-            g = np.mean(rho)/vf - 1.
-            return g
-        c, gradc = jax.value_and_grad(computeGlobalVolumeConstraint)(rho)
-        c, gradc = c.reshape((1,)), gradc[None, ...]
-        return c, gradc
+        # Prepare g and dg/d(theta) that are required by the MMA optimizer.
+        def consHandle(rho, epoch):
+            # MMA solver requires (c, dc) as inputs
+            # c should have shape (numConstraints,)
+            # dc should have shape (numConstraints, ...)
+            def computeGlobalVolumeConstraint(rho):
+                g = np.mean(rho)/vf - 1.
+                return g
+            c, gradc = jax.value_and_grad(computeGlobalVolumeConstraint)(rho)
+            c, gradc = c.reshape((1,)), gradc[None, ...]
+            return c, gradc
 
-    # Finalize the details of the MMA optimizer, and solve the TO problem.
-    vf = 0.5
-    optimizationParams = {'maxIters':51, 'movelimit':0.1}
-    rho_ini = vf*np.ones((len(problem.fe.flex_inds), 1))
-    numConstraints = 1
-    optimize(problem.fe, rho_ini, optimizationParams, objectiveHandle, consHandle, numConstraints)
-    print(f"As a reminder, compliance = {J_total(np.ones((len(problem.fe.flex_inds), 1)))} for full material")
-    np.save(os.path.join(run_dir, f'compliance_log.npy'), np.array(compliance_log))
-    np.save(os.path.join(run_dir, 'x_load.npy'), np.array(x_load))
+        # Finalize the details of the MMA optimizer, and solve the TO problem.
+        optimizationParams = {'maxIters':51, 'movelimit':0.1}
+        rho_ini = vf*np.ones((len(problem.fe.flex_inds), 1))
+        numConstraints = 1
+        optimize(problem.fe, rho_ini, optimizationParams, objectiveHandle, consHandle, numConstraints)
+        print(f"As a reminder, compliance = {J_total(np.ones((len(problem.fe.flex_inds), 1)))} for full material")
+        np.save(os.path.join(run_dir, f'compliance_log.npy'), np.array(compliance_log))
+        np.save(os.path.join(run_dir, 'x_load.npy'), np.array(x_load))
+        np.save(os.path.join(run_dir, 'vf.npy'), np.array(vf))
+        np.save(os.path.join(run_dir, 'theta_log.npy'), onp.array(theta_log))
+
+        print(f"Run {run_idx+1}/295 | vf={vf} | x_load={x_load}")
+
+        run_idx += 1
