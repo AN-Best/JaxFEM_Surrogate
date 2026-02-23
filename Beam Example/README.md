@@ -58,7 +58,7 @@ The trained PyTorch surrogate is wrapped to provide both the compliance value an
 
 ## Results
 
-Comparison of the converged density fields for a center load (`x_load = 30`):
+Comparison of the converged density fields for an end load (`x_load = 60`):
 
 ![Comparison](comparison.png)
 
