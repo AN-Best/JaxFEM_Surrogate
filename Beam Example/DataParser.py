@@ -3,7 +3,7 @@ import os
 
 main_folder = os.path.join(os.path.dirname(__file__), 'DataSet_data')
 
-n_runs = 13
+n_runs = 295
 n_iter = 51
 
 X_theta = []

@@ -2,7 +2,6 @@ import numpy as onp
 import jax
 import jax.numpy as np
 import os
-import glob
 import torch
 import torch.nn as nn
 
@@ -13,6 +12,9 @@ from jax_fem.utils import save_sol
 from jax_fem.generate_mesh import get_meshio_cell_type, Mesh, rectangle_mesh
 from jax_fem.mma import optimize
 
+import logging
+logging.getLogger('jax_fem').setLevel(logging.WARNING)
+
 # ─────────────────────────────────────────────
 # Surrogate model definition (must match training)
 # ─────────────────────────────────────────────
@@ -22,51 +24,64 @@ class SurrogateModel(nn.Module):
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),                              # (16, 30, 15)
+            nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),                              # (32, 15, 7)
-            nn.Flatten()                                  # (32*15*7,)
+            nn.MaxPool2d(2),
+            nn.Flatten()
         )
         self.fc = nn.Sequential(
-            nn.Linear(32*15*7 + 1, 128),
+            nn.Linear(32*15*7 + 2, 128),                 # +2 for x_load and vf
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+            nn.Softplus()                                 # guarantees positive output
         )
 
-    def forward(self, theta, x_load):
+    def forward(self, theta, x_load, vf):
         features = self.cnn(theta)
-        x = torch.cat([features, x_load.unsqueeze(1)], dim=1)
+        x = torch.cat([features, x_load.unsqueeze(1), vf.unsqueeze(1)], dim=1)
         return self.fc(x).squeeze(1)
 
 
 # ─────────────────────────────────────────────
-# Load surrogate
+# Load surrogate and normalization stats
 # ─────────────────────────────────────────────
 surrogate_path = os.path.join(os.path.dirname(__file__), 'surrogate.pt')
 checkpoint = torch.load(surrogate_path)
 surrogate = SurrogateModel()
 surrogate.load_state_dict(checkpoint['model'])
 surrogate.eval()
+
 y_mean = float(checkpoint['y_mean'])
 y_std = float(checkpoint['y_std'])
+x_load_mean = float(checkpoint['x_load_mean'])
+x_load_std = float(checkpoint['x_load_std'])
+x_vf_mean = float(checkpoint['x_vf_mean'])
+x_vf_std = float(checkpoint['x_vf_std'])
 
 
-def surrogate_objective(rho, x_load_val):
+def surrogate_objective(rho, x_load_val, vf_val):
     """Wraps PyTorch surrogate to return (J, dJ/drho) as JAX arrays."""
-    rho_np = onp.array(rho)                                      # (1800, 1)
+    rho_np = onp.array(rho)
     rho_tensor = torch.tensor(rho_np, dtype=torch.float32)
     rho_tensor = rho_tensor.reshape(1, 1, 60, 30).requires_grad_(True)
-    x_load_tensor = torch.tensor([x_load_val], dtype=torch.float32)
+
+    # Normalize scalar inputs to match training distribution
+    x_load_norm = (x_load_val - x_load_mean) / x_load_std
+    vf_norm = (vf_val - x_vf_mean) / x_vf_std
+
+    x_load_tensor = torch.tensor([x_load_norm], dtype=torch.float32)
+    vf_tensor = torch.tensor([vf_norm], dtype=torch.float32)
 
     # Forward pass
-    J_norm = surrogate(rho_tensor, x_load_tensor)
+    J_norm = surrogate(rho_tensor, x_load_tensor, vf_tensor)
 
     # Backward pass
     J_norm.backward()
 
     # Denormalize compliance
-    J = float(J_norm.item() * y_std + y_mean)
+    J = float(torch.exp(torch.tensor(J_norm.item() * y_std + y_mean)).item())
 
     # Denormalize gradient via chain rule
     dJ = rho_tensor.grad.reshape(1800, 1).detach().numpy()
@@ -86,7 +101,7 @@ mesh = Mesh(meshio_mesh.points, meshio_mesh.cells_dict[cell_type])
 
 
 # ─────────────────────────────────────────────
-# FEM problem (needed for mesh/output only — not for objective)
+# FEM problem (needed for visualization only)
 # ─────────────────────────────────────────────
 class Elasticity(Problem):
     def custom_init(self):
@@ -125,10 +140,14 @@ class Elasticity(Problem):
 
 
 # ─────────────────────────────────────────────
-# Run surrogate-driven topology optimization
+# Parameters — change these to test different cases
 # ─────────────────────────────────────────────
-x_load = 60.0  # change this to test different load locations
+x_load = 60.0
+vf = 0.5
 
+# ─────────────────────────────────────────────
+# Problem setup
+# ─────────────────────────────────────────────
 def fixed_location(point):
     return np.isclose(point[0], 0., atol=1e-5)
 
@@ -155,9 +174,9 @@ data_path = os.path.join(os.path.dirname(__file__), 'NNTopoOpt_results')
 os.makedirs(os.path.join(data_path, 'vtk'), exist_ok=True)
 
 compliance_log = []
+theta_log = []
 
 def output_sol(params, obj_val):
-    # We still need a FEM solve to visualize — use the real solver here
     fwd_pred = ad_wrapper(problem, solver_options={'umfpack_solver': {}},
                           adjoint_solver_options={'umfpack_solver': {}})
     sol_list = fwd_pred(params)
@@ -171,8 +190,9 @@ output_sol.counter = 0
 
 
 def objectiveHandle(rho):
-    J, dJ = surrogate_objective(rho, x_load)
+    J, dJ = surrogate_objective(rho, x_load, vf)
     compliance_log.append(float(J))
+    theta_log.append(onp.array(rho).reshape(60, 30))
     output_sol(rho, J)
     return J, dJ
 
@@ -186,7 +206,6 @@ def consHandle(rho, epoch):
     return c, gradc
 
 
-vf = 0.5
 optimizationParams = {'maxIters': 51, 'movelimit': 0.1}
 rho_ini = vf * np.ones((len(problem.fe.flex_inds), 1))
 numConstraints = 1
@@ -194,4 +213,5 @@ numConstraints = 1
 optimize(problem.fe, rho_ini, optimizationParams, objectiveHandle, consHandle, numConstraints)
 
 onp.save(os.path.join(data_path, 'compliance_log.npy'), onp.array(compliance_log))
+onp.save(os.path.join(data_path, 'theta_log.npy'), onp.array(theta_log))
 print(f"Done. Final compliance: {compliance_log[-1]:.4f}")

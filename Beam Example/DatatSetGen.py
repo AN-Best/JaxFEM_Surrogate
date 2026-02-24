@@ -132,6 +132,7 @@ for vf in [0.3, 0.4, 0.5, 0.6, 0.7]:
 
         compliance_log = []
         theta_log = []
+        sol_log = []
 
         # Prepare J_total and dJ/d(theta) that are required by the MMA optimizer.
         def objectiveHandle(rho):
@@ -139,8 +140,11 @@ for vf in [0.3, 0.4, 0.5, 0.6, 0.7]:
             # J has shape ()
             # dJ has shape (...) = rho.shape
             J, dJ = jax.value_and_grad(J_total)(rho)
+            sol_list = fwd_pred(rho)
+            sol = np.array(sol_list[0]) 
             compliance_log.append(float(J))
             theta_log.append(onp.array(rho).reshape(60, 30))  # save density directly
+            sol_log.append(sol[:, :2])  # just x,y displacements, drop z padding → (1891, 2)
             return J, dJ
 
 
@@ -165,7 +169,8 @@ for vf in [0.3, 0.4, 0.5, 0.6, 0.7]:
         np.save(os.path.join(run_dir, f'compliance_log.npy'), np.array(compliance_log))
         np.save(os.path.join(run_dir, 'x_load.npy'), np.array(x_load))
         np.save(os.path.join(run_dir, 'vf.npy'), np.array(vf))
-        np.save(os.path.join(run_dir, 'theta_log.npy'), onp.array(theta_log))
+        np.save(os.path.join(run_dir, 'theta_log.npy'), np.array(theta_log))
+        np.save(os.path.join(run_dir, 'sol_log.npy'), onp.array(sol_log))
 
         print(f"Run {run_idx+1}/295 | vf={vf} | x_load={x_load}")
 
